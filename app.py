@@ -1072,16 +1072,17 @@ def init_agent():
             except Exception as e: return f"Search error: {e}"
         tools_list.append(search_web_extract_info)
 
-    @tool
-    def get_weather(query: str) -> str:
-        """Get current weather for a location."""
-        try:
-            data = req.get("http://api.weatherapi.com/v1/current.json", params={"key": WK, "q": query}, timeout=10).json()
-            if data.get("location"):
-                l, c = data["location"], data["current"]
-                return f"Weather in {l['name']}, {l.get('country','')}:\nTemp: {c['temp_c']}°C/{c['temp_f']}°F\nCondition: {c['condition']['text']}\nHumidity: {c['humidity']}%\nWind: {c['wind_kph']} km/h {c.get('wind_dir','')}\nFeels like: {c['feelslike_c']}°C/{c['feelslike_f']}°F"
-            return "Location not found."
-        except Exception as e: return f"Weather error: {e}"tools_list.append(get_weather)
+        @tool
+        def get_weather(query: str) -> str:
+            """Get current weather for a location."""
+            try:
+                data = req.get("http://api.weatherapi.com/v1/current.json", params={"key": WK, "q": query}, timeout=10).json()
+                if data.get("location"):
+                    l, c = data["location"], data["current"]
+                    return f"Weather in {l['name']}, {l.get('country','')}:\nTemp: {c['temp_c']}°C/{c['temp_f']}°F\nCondition: {c['condition']['text']}\nHumidity: {c['humidity']}%\nWind: {c['wind_kph']} km/h {c.get('wind_dir','')}\nFeels like: {c['feelslike_c']}°C/{c['feelslike_f']}°F"
+                return "Location not found."
+            except Exception as e: return f"Weather error: {e}"
+        tools_list.append(get_weather)
 
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
     today_str = datetime.now().strftime("%B %d, %Y")
