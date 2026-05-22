@@ -1,5 +1,5 @@
 """
-Dentsu Smart Buddy — v6.0 (Adaptive + Corrective RAG)
+Smart chatbot(AI Prof) — v6.0 (Adaptive + Corrective RAG)
 =========================================
 Architecture:
   • Day1: RecursiveCharacterTextSplitter chunking + AzureOpenAIEmbeddings
@@ -25,7 +25,7 @@ from warnings import filterwarnings
 filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="Dentsu Smart Buddy",
+    page_title="Smart chatbot(AI Prof)",
     page_icon="🔵",
     layout="wide",
     initial_sidebar_state="expanded",
