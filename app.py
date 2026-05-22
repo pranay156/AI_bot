@@ -1,15 +1,10 @@
 """
-Dentsu Smart Buddy — v5.1 (Production)
+Dentsu Smart Buddy — v6.0 (Adaptive + Corrective RAG)
 =========================================
-Features:
-  1. Smart keyword-based routing (no LLM hallucination) — works per doc type
-  2. Professional onboarding page — "Dentsu Smart Buddy"
-  3. URL/blog link → WebLoader → Q&A
-  4. CSV/Excel → pandas analysis + chart generation
-  5. Multi-document interaction (image + doc + csv simultaneously)
-  6. Compatible with langchain==1.2.17, langchain-core==1.3.3,
-     langchain-classic==1.0.5, langchain-community==0.4.1,
-     langchain-openai==1.1.10 on Python 3.11
+Architecture:
+  • Day1: RecursiveCharacterTextSplitter chunking + AzureOpenAIEmbeddings
+  • Day 2: Chroma vectorstore + BM25 hybrid retrieval + LangGraph orchestration
+  • Day 3: Adaptive Router (vectorstore / web_search / direct)Corrective RAG (grade → rewrite → web fallback)
 """
 
 import streamlit as st
@@ -23,6 +18,8 @@ import base64
 import html as html_lib
 import io
 from datetime import datetime
+from typing import TypedDict, List, Literal
+from pydantic import BaseModel, Field
 from warnings import filterwarnings
 
 filterwarnings("ignore")
@@ -92,8 +89,7 @@ section[data-testid="stSidebar"] .stMarkdown span {
 }
 .brand-box .logo {
     font-size: 1.15rem; font-weight: 700; color: var(--primary);
-    letter-spacing: 0.08em;
-    display: flex; align-items: center; justify-content: center; gap: 0.45rem;
+    letter-spacing: 0.08em;display: flex; align-items: center; justify-content: center; gap: 0.45rem;
 }
 .brand-box .sub {
     font-size: 0.62rem; color: var(--text-400);
@@ -116,7 +112,6 @@ section[data-testid="stSidebar"] .stMarkdown span {
 
 .sd { border: none; border-top: 1px solid var(--border); margin: 0.9rem 0; }
 
-/* ── Professional Login ── */
 .login-brand {
     text-align: center; margin-bottom: 2rem;
 }
@@ -150,7 +145,6 @@ section[data-testid="stSidebar"] .stMarkdown span {
 }
 .login-feat .lf-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
 
-/* Chat */
 [data-testid="stChatMessage"] {
     background: var(--bg-card) !important; border: 1px solid var(--border) !important;
     border-radius: var(--radius-md) !important; padding: 0.8rem 1rem !important;
@@ -292,8 +286,7 @@ def register_user(username, password):
     uid = str(uuid.uuid4()); display = username.strip().title()
     conn = sqlite3.connect(DB_PATH)
     try:
-        conn.execute("INSERT INTO users VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
-                     (uid, username.lower().strip(), _hash(password), display, "user"))
+        conn.execute("INSERT INTO users VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",(uid, username.lower().strip(), _hash(password), display, "user"))
         conn.commit(); conn.close()
         return {"user_id": uid, "username": username.lower().strip(), "display_name": display, "role": "user"}
     except sqlite3.IntegrityError:
@@ -409,7 +402,6 @@ def extract_image(f):
     except Exception as e: return f"[Image error: {e}]"
 
 def extract_csv_excel(f):
-    """Read CSV/Excel into pandas, store as JSON-safe marker."""
     try:
         import pandas as pd
         f.seek(0); name = f.name.lower()
@@ -420,7 +412,6 @@ def extract_csv_excel(f):
         else:
             return "[Unsupported tabular format]"
 
-        # Store everything as a single JSON blob — no pipe delimiter issues
         payload = {
             "shape": f"{df.shape[0]} rows × {df.shape[1]} columns",
             "columns": {col: str(df[col].dtype) for col in df.columns},
@@ -438,14 +429,12 @@ def is_dataframe_data(text):
     return text and text.startswith("__DATAFRAME__")
 
 def parse_image_data(text):
-    """Extract mime and b64 from image marker."""
     try:
         payload = json.loads(text[len("__IMAGE_B64__"):])
         return payload["mime"], payload["b64"]
     except: return None, None
 
 def parse_dataframe(text):
-    """Reconstruct pandas DataFrame from marker."""
     try:
         import pandas as pd
         payload = json.loads(text[len("__DATAFRAME__"):])
@@ -512,11 +501,10 @@ def get_llm(max_tokens=2000):
 
 
 # ═══════════════════════════════════════════════
-# SMART ROUTING — keyword-based, no LLM hallucination
+# DOC TYPE CLASSIFIER (used by chat router)
 # ═══════════════════════════════════════════════
 
 def classify_doc_types():
-    """Classify all uploaded docs into categories."""
     image_entries = {}
     text_entries = {}
     df_entries = {}
@@ -529,74 +517,256 @@ def classify_doc_types():
             text_entries[fn] = txt
     return image_entries, text_entries, df_entries
 
-def build_doc_topic_keywords():
-    """Extract actual keywords from document content for matching."""
-    keywords = set()
+
+# ═══════════════════════════════════════════════
+# RAG PIPELINE — Day 1 (chunking/embeddings) + Day 3 (Adaptive + Corrective)
+# ═══════════════════════════════════════════════
+
+def get_embeddings():
+    from langchain_openai import AzureOpenAIEmbeddings
+    return AzureOpenAIEmbeddings(
+        azure_deployment=st.session_state.get("azure_embed_deployment", "text-embedding-3-small"),
+        api_version="2024-12-01-preview",
+        azure_endpoint=st.session_state["azure_endpoint"],
+        api_key=st.session_state["azure_api_key"],)
+
+def build_vectorstore_from_docs():
+    """Chunk all text/URL documents → embed → index in Chroma + BM25."""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_chroma import Chroma
+    from langchain_core.documents import Document
+    from langchain_community.retrievers import BM25Retriever
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+    all_chunks = []
     for fn, txt in st.session_state.get("doc_texts", {}).items():
-        if is_image_data(txt):
-            keywords.update(["image", "picture", "photo", "diagram", "screenshot", fn.lower()])
-        elif is_dataframe_data(txt):
-            _, payload = parse_dataframe(txt)
-            if payload:
-                for col in payload.get("columns", {}).keys():
-                    keywords.update(col.lower().split("_"))
-                    keywords.update(col.lower().split(" "))
-            keywords.update(["data", "csv", "excel", "table", "column", "row", fn.lower()])
-        else:
-            # Extract top words from text documents
-            words = re.findall(r'\b[a-zA-Z]{3,}\b', txt[:3000].lower())
-            # Get most frequent meaningful words
-            from collections import Counter
-            common = Counter(words).most_common(50)
-            stop = {"the","and","for","are","but","not","you","all","can","had","her","was","one",
-                    "our","out","has","have","been","from","this","that","with","they","will","each",
-                    "which","their","said","what","its","about","than","into","them","some","could",
-                    "other","more","very","when","come","make","like","over","such","also","most"}
-            for w, _ in common:
-                if w not in stop: keywords.add(w)
-            keywords.add(fn.lower().replace(".pdf","").replace(".docx","").replace(".txt",""))
-    return keywords
+        if is_image_data(txt) or is_dataframe_data(txt):
+            continue
+        for i, chunk in enumerate(splitter.split_text(txt)):
+            all_chunks.append(Document(
+                page_content=chunk,
+                metadata={"source": fn, "chunk_id": i}
+            ))
 
-def is_query_about_docs(query):
-    """Keyword overlap check — fast, no hallucination."""
-    doc_keywords = build_doc_topic_keywords()
-    if not doc_keywords:
-        return False
+    if not all_chunks:
+        return None, None
 
-    query_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', query.lower()))
+    vectorstore = Chroma.from_documents(
+        all_chunks, get_embeddings(),
+        collection_name=f"docs_{uuid.uuid4().hex[:8]}"
+    )
+    bm25 = BM25Retriever.from_documents(all_chunks)
+    bm25.k = 4
+    return vectorstore, bm25
 
-    # Direct reference to document or file
-    direct_refs = {"document", "file", "uploaded", "pdf", "report", "article", "csv",
-                   "excel", "spreadsheet", "image", "picture", "photo", "data", "table",
-                   "chart", "plot", "graph", "column", "analyze", "summarize", "summary",
-                   "extract", "describe", "explain", "what", "list", "content"}
-    if query_words & direct_refs:
-        return True
+def hybrid_retrieve(query, k=4):
+    """BM25 + dense vector retrieval, deduped."""
+    vs = st.session_state.get("vectorstore")
+    bm25 = st.session_state.get("bm25_retriever")
+    if not vs:
+        return []
+    dense_docs = vs.similarity_search(query, k=k)
+    sparse_docs = bm25.invoke(query) if bm25 else []
+    seen, merged = set(), []
+    for d in dense_docs + sparse_docs:
+        key = (d.metadata.get("source"), d.metadata.get("chunk_id"))
+        if key not in seen:
+            seen.add(key); merged.append(d)
+    return merged[:k+2]
 
-    # Check overlap with actual doc content keywords
-    overlap = query_words & doc_keywords
-    # If at least 2 content words match, or 1 match + short query
-    if len(overlap) >= 2:
-        return True
-    if len(overlap) >= 1 and len(query_words) <= 5:
-        return True
 
-    return False
+# ── Adaptive Router (Day 3) ──
+class RouteQuery(BaseModel):
+    """Route a query to the most appropriate datasource."""
+    datasource: Literal["vectorstore", "web_search", "direct"] = Field(
+        description="vectorstore for doc questions; web_search for current events; direct for greetings/chit-chat"
+    )
+
+def route_question(query, has_docs):
+    if not has_docs:
+        return "web_search"
+    from langchain_core.prompts import ChatPromptTemplate
+    llm = get_llm(max_tokens=50)
+    router_llm = llm.with_structured_output(RouteQuery)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an expert at routing user questions.\n""-'vectorstore': question is about uploaded documents/files/articles\n"
+                   "- 'web_search': question about current events, news, real-time info, or topics not in docs\n"
+                   "- 'direct': simple greetings, thanks, chit-chat, or meta-questions"),
+        ("human", "{q}")
+    ])
+    try:
+        result = (prompt | router_llm).invoke({"q": query})
+        return result.datasource
+    except Exception:
+        return "vectorstore"
+
+
+# ── Corrective Grader (Day 3) ──
+class GradeDocument(BaseModel):
+    """Binary relevance score for a retrieved document."""
+    binary_score: Literal["yes", "no"] = Field(description="Is this document relevant to the question?")
+
+def grade_documents(query, docs):
+    """Filter retrieved docs to only relevant ones."""
+    from langchain_core.prompts import ChatPromptTemplate
+    llm = get_llm(max_tokens=20)
+    grader = llm.with_structured_output(GradeDocument)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You grade retrieved documents for relevance to a user question. "
+                   "Output'yes' if the document contains keywords or semantic meaning related to the question, else 'no'."),
+        ("human", "Document:\n{doc}\n\nQuestion: {q}")
+    ])
+    relevant = []
+    for d in docs:
+        try:
+            r = (prompt | grader).invoke({"doc": d.page_content[:1500], "q": query})
+            if r.binary_score == "yes":
+                relevant.append(d)
+        except Exception:
+            relevant.append(d)
+    return relevant
+
+def rewrite_query(query):
+    """Rewrite query for better web search after CRAG fallback."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+    llm = get_llm(max_tokens=100)
+    resp = llm.invoke([
+        SystemMessage(content="Rewrite the user's question to be a clearer, more searchable web query. Output only the rewritten question."),
+        HumanMessage(content=query)
+    ])
+    return resp.content.strip()
+
+
+# ── LangGraph: Adaptive + Corrective RAG ──
+class RAGState(TypedDict):
+    query: str
+    rewritten_query: str
+    documents: List
+    generation: str
+    sources: list
+    tool_info: str
+    route: str
+
+def node_route(state):
+    has_docs = bool(st.session_state.get("vectorstore"))
+    return {"route": route_question(state["query"], has_docs)}
+
+def node_retrieve(state):
+    docs = hybrid_retrieve(state["query"], k=4)
+    return {"documents": docs}
+
+def node_grade(state):
+    relevant = grade_documents(state["query"], state["documents"])
+    return {"documents": relevant}
+
+def node_rewrite(state):
+    return {"rewritten_query": rewrite_query(state["query"])}
+
+def node_web_search(state):
+    from langchain_community.tools.tavily_search import TavilySearchResults
+    from langchain_core.documents import Document
+    os.environ["TAVILY_API_KEY"] = "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"
+    q = state.get("rewritten_query") or state["query"]
+    try:
+        results = TavilySearchResults(max_results=4, search_depth="advanced").invoke(q)
+        web_docs = [Document(page_content=r.get("content", ""), metadata={"source": r.get("url", "web")}) for r in results]
+        return {"documents": (state.get("documents") or []) + web_docs, "tool_info": "Web Search (CRAG)"}
+    except Exception as e:
+        return {"documents": state.get("documents") or [], "tool_info": f"Web error: {e}"}
+
+def node_generate(state):
+    from langchain_core.messages import HumanMessage, SystemMessage
+    llm = get_llm(max_tokens=2000)
+    today_str = datetime.now().strftime("%B %d, %Y")
+    docs = state.get("documents") or []
+    if not docs:
+        ctx = "[No relevant context retrieved.]"
+    else:
+        ctx = "\n\n---\n\n".join(
+            f"[Source: {d.metadata.get('source', '?')}]\n{d.page_content}" for d in docs
+        )
+    resp = llm.invoke([
+        SystemMessage(content=f"You are Dentsu Smart Buddy. Today is {today_str}. "
+                              "Answer usingONLY the provided context. Cite sources inline. "
+                              "If context is insufficient, say so. Format with markdown."),
+        HumanMessage(content=f"Question: {state['query']}\n\nContext:\n{ctx}")
+    ])
+    sources = []
+    seen = set()
+    for d in docs:
+        s = d.metadata.get("source", "")
+        if s.startswith("http") and s not in seen:
+            seen.add(s)
+            from urllib.parse import urlparse
+            sources.append({"url": s, "domain": urlparse(s).netloc})
+    return {"generation": resp.content, "sources": sources}
+
+def node_direct(state):
+    from langchain_core.messages import HumanMessage, SystemMessage
+    llm = get_llm(max_tokens=300)
+    resp = llm.invoke([
+        SystemMessage(content="You are Dentsu Smart Buddy. Be friendly and concise."),
+        HumanMessage(content=state["query"])
+    ])
+    return {"generation": resp.content, "sources": [], "tool_info": "Direct"}
+
+def decide_route(state):
+    r = state["route"]
+    if r == "web_search": return "web_search"
+    if r == "direct": return "direct"
+    return "retrieve"
+
+def decide_after_grade(state):
+    if not state.get("documents"):
+        return "rewrite"
+    return "generate"
+
+def build_rag_graph():
+    from langgraph.graph import StateGraph, END
+    g = StateGraph(RAGState)
+    g.add_node("route", node_route)
+    g.add_node("retrieve", node_retrieve)
+    g.add_node("grade", node_grade)
+    g.add_node("rewrite", node_rewrite)
+    g.add_node("web_search", node_web_search)
+    g.add_node("generate", node_generate)
+    g.add_node("direct", node_direct)
+
+    g.set_entry_point("route")
+    g.add_conditional_edges("route", decide_route,
+        {"retrieve": "retrieve", "web_search": "rewrite", "direct": "direct"})
+    g.add_edge("retrieve", "grade")
+    g.add_conditional_edges("grade", decide_after_grade,
+        {"rewrite": "rewrite", "generate": "generate"})
+    g.add_edge("rewrite", "web_search")
+    g.add_edge("web_search", "generate")
+    g.add_edge("generate", END)
+    g.add_edge("direct", END)
+    return g.compile()
+
+def run_rag(query):
+    if "rag_graph" not in st.session_state:
+        st.session_state["rag_graph"] = build_rag_graph()
+    final = st.session_state["rag_graph"].invoke({"query": query})
+    route = final.get("route", "")
+    tool_info = final.get("tool_info") or ("Adaptive RAG" if route == "vectorstore" else route.title())
+    return final.get("generation", ""), final.get("sources", []), tool_info
 
 
 # ═══════════════════════════════════════════════
-# EXECUTION PATHS
+# EXECUTION PATHS — Image (vision) + DataFrame (pandas)
 # ═══════════════════════════════════════════════
 
 def run_combined_query(prompt, image_entries, text_entries, df_entries, user, cid):
     """
-    Handle queries across ALL doc types simultaneously.
-    Images + text + dataframes all contribute context.
-    Returns (answer, sources, tool_info, chart_fig_or_None)
+    Multimodal path: handles images alongside text/dataframe context.
+    Used when images are uploaded.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    # Determine if this is primarily a data analysis/chart request
     is_data_query = bool(df_entries) and any(kw in prompt.lower() for kw in [
         "chart", "plot", "graph", "visuali", "bar", "pie", "line", "histogram",
         "scatter", "trend", "distribution", "average", "mean", "sum", "count",
@@ -604,38 +774,32 @@ def run_combined_query(prompt, image_entries, text_entries, df_entries, user, ci
         "filter", "percentage", "ratio", "growth", "correlation"
     ])
 
-    # If data analysis needed, run the pandas engine
     if is_data_query:
         answer, fig = run_dataframe_analysis(prompt, df_entries)
-        # Also add text context if user references both
         if text_entries and any(w in prompt.lower() for w in ["document", "report", "pdf", "text", "article"]):
             text_answer, _, _ = run_doc_qa(prompt, text_entries, user, cid)
             answer = f"{answer}\n\n---\n\n**From your documents:**\n{text_answer}"
         return answer, [], "Data Analysis", fig
 
-    # Build multimodal content for the LLM
     content_parts = [{"type": "text", "text": prompt}]
     has_images = bool(image_entries)
     today_str = datetime.now().strftime("%B %d, %Y")
 
-    # Add text document context
     doc_ctx_parts = []
     if text_entries:
         for fn, txt in text_entries.items():
             doc_ctx_parts.append(f"[Document: {fn}]\n{txt[:4000]}")
 
-    # Add DataFrame previews as text context
     if df_entries:
         for fn, raw in df_entries.items():
             _, payload = parse_dataframe(raw)
             if payload:
-                doc_ctx_parts.append(f"[Data: {fn} ({payload['shape']})]\n{payload['preview_md'][:2000]}")
+                doc_ctx_parts.append(f"[Data: {fn}({payload['shape']})]\n{payload['preview_md'][:2000]}")
 
     if doc_ctx_parts:
         full_ctx = "\n\n---\n\n".join(doc_ctx_parts)
         content_parts[0]["text"] += f"\n\n[Uploaded document context:]\n{full_ctx}"
 
-    # Add images
     if has_images:
         for fn, img_data in image_entries.items():
             mime, b64 = parse_image_data(img_data)
@@ -645,16 +809,15 @@ def run_combined_query(prompt, image_entries, text_entries, df_entries, user, ci
                     "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}
                 })
 
-    # Use vision-capable model if images present
     try:
         llm = get_llm(max_tokens=2000)
         sys_content = f"You are Dentsu Smart Buddy. Today is {today_str}. "
         if has_images:
             sys_content += ("Analyze any provided images in detail alongside document text. "
-                           "Describe what you see, extract text/data if present. ")
-        sys_content += ("Answer using the provided document/image context. "
-                       "If the answer isn't in the provided materials, say so clearly. "
-                       "Format with markdown. Be thorough but concise.")
+                            "Describe what you see, extract text/data if present.")
+        sys_content +=("Answer using the provided document/image context. "
+                        "If the answer isn't in the provided materials, say so clearly. "
+                        "Format with markdown. Be thorough but concise.")
 
         messages = [SystemMessage(content=sys_content), HumanMessage(content=content_parts)]
         response = llm.invoke(messages)
@@ -710,7 +873,7 @@ Write Python code that:
 1. Uses variable `df` (pandas DataFrame, already loaded)
 2. Uses matplotlib to create the chart
 3. Creates figure: fig, ax = plt.subplots(figsize=(10, 6))
-4. Style: dark background '#161B25', white text, colors ['#0033A0','#00C4B3','#6B8AFF','#FF6B6B','#FFB347']
+4. Style: dark background '#161B25', white text, colors['#0033A0','#00C4B3','#6B8AFF','#FF6B6B','#FFB347']
 5. Add title, labels. DO NOT call plt.show()
 
 Output ONLY Python code. No explanation. No markdown fences."""
@@ -734,9 +897,8 @@ Output ONLY Python code. No explanation. No markdown fences."""
                 exec(code, exec_globals)
                 fig = exec_globals.get("fig", plt.gcf())
 
-                # Generate insight
                 resp2 = llm.invoke([
-                    SystemMessage(content="You are a data analyst. Be concise — 2-3 sentences with specific numbers."),
+                    SystemMessage(content="You are a data analyst. Be concise —2-3 sentences with specific numbers."),
                     HumanMessage(content=f"Schema:\n{schema_info}\n\nUser asked: {query}\nChart was generated. Write a brief insight.")
                 ])
                 return resp2.content.strip(), fig
@@ -781,7 +943,7 @@ Output ONLY Python code. No markdown fences."""
 
 
 def run_doc_qa(prompt, text_entries, user, cid):
-    """Answer from text documents only."""
+    """Lightweight text-only QA (used as helper inside run_combined_query)."""
     snippets = [f"[Document: {fn}]\n{txt[:4000]}" for fn, txt in text_entries.items()]
     doc_context = "\n\n---\n\n".join(snippets)
     augmented = f"{prompt}\n\n[Uploaded document context:]\n{doc_context}"
@@ -802,7 +964,7 @@ def run_doc_qa(prompt, text_entries, user, cid):
 
 
 def run_web_agent(prompt, user, cid):
-    """Run the full web agent (Tavily + weather)."""
+    """Fallback web agent (Tavily + weather)."""
     agent = st.session_state.get("agent")
     if agent is None:
         agent, error = init_agent()
@@ -841,10 +1003,9 @@ def extract_sources(text):
 def clean_answer_urls(text, sources):
     if not sources: return text
     protected = text; phs = {}
-    for i, m in enumerate(re.finditer(r'\[([^\]]+)\]\(https?://[^\)]+\)', text)):
-        ph = f"MDLNK{i}X"; phs[ph] = m.group(0); protected = protected.replace(m.group(0), ph, 1)
+    for i, m in enumerate(re.finditer(r'\[([^\]]+)\]\(https?://[^\)]+\)', text)):ph = f"MDLNK{i}X"; phs[ph] = m.group(0); protected = protected.replace(m.group(0), ph, 1)
     cleaned = re.sub(r'https?://[^\s\)\]>"\'`,]+', '', protected)
-    for ph, orig in phs.items(): cleaned = cleaned.replace(ph, orig)
+    forph, orig in phs.items(): cleaned = cleaned.replace(ph, orig)
     cleaned = re.sub(r'Source:\s*$', '', cleaned, flags=re.M)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
@@ -860,7 +1021,7 @@ def render_sources_and_tools(sources, tools):
     if sources:
         chips = ""
         for s in sources:
-            d = s.get("domain", ""); u = html_lib.escape(s.get("url", "#"))
+            d = s.get("domain",""); u = html_lib.escape(s.get("url", "#"))
             chips += f'<a href="{u}" target="_blank" rel="noopener" class="src-chip"><span class="sd2"></span>{get_domain_label(d)} · {d}</a>'
         parts.append(f'<div class="src-box"><div class="src-label">📎 Sources</div><div class="src-chips">{chips}</div></div>')
     if tools:
@@ -872,7 +1033,7 @@ def render_sources_and_tools(sources, tools):
 
 
 # ═══════════════════════════════════════════════
-# AGENT
+# AGENT (web fallback)
 # ═══════════════════════════════════════════════
 
 def init_agent():
@@ -919,8 +1080,7 @@ def init_agent():
                 l, c = data["location"], data["current"]
                 return f"Weather in {l['name']}, {l.get('country','')}:\nTemp: {c['temp_c']}°C/{c['temp_f']}°F\nCondition: {c['condition']['text']}\nHumidity: {c['humidity']}%\nWind: {c['wind_kph']} km/h {c.get('wind_dir','')}\nFeels like: {c['feelslike_c']}°C/{c['feelslike_f']}°F"
             return "Location not found."
-        except Exception as e: return f"Weather error: {e}"
-    tools_list.append(get_weather)
+        except Exception as e: return f"Weather error: {e}"tools_list.append(get_weather)
 
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
     today_str = datetime.now().strftime("%B %d, %Y")
@@ -937,8 +1097,7 @@ Format answers with markdown. Include source URLs. Be thorough but concise."""),
 
     from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
     agent = create_tool_calling_agent(llm, tools_list, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools_list, early_stopping_method="force",
-                             max_iterations=5, verbose=False, return_intermediate_steps=True,
+    executor = AgentExecutor(agent=agent, tools=tools_list, early_stopping_method="force",max_iterations=5, verbose=False, return_intermediate_steps=True,
                              handle_parsing_errors=True)
 
     from langchain_community.chat_message_histories import SQLChatMessageHistory
@@ -965,13 +1124,11 @@ def render_login():
             <div class="lb-desc">
                 Your AI-powered research companion — analyze documents, explore data,
                 search the web, and get insights in seconds.
-            </div>
-            <div class="login-features">
-                <div class="login-feat"><span class="lf-dot"></span> Document Q&A</div>
-                <div class="login-feat"><span class="lf-dot"></span> Data Analysis</div>
-                <div class="login-feat"><span class="lf-dot"></span> Web Research</div>
-                <div class="login-feat"><span class="lf-dot"></span> URL Ingestion</div>
-                <div class="login-feat"><span class="lf-dot"></span> Smart Charts</div>
+            </div><div class="login-features">
+                <div class="login-feat"><span class="lf-dot"></span> Adaptive RAG</div>
+                <div class="login-feat"><span class="lf-dot"></span> Corrective RAG</div>
+                <div class="login-feat"><span class="lf-dot"></span> Hybrid Retrieval</div>
+                <div class="login-feat"><span class="lf-dot"></span> Data Analysis</div><div class="login-feat"><span class="lf-dot"></span> Vision</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1002,8 +1159,7 @@ def render_login():
                     else:
                         r = register_user(nc, p1)
                         if r: st.success(f"Account created! Sign in as **{nc}**.")
-                        else: st.error("Username already taken.")
-        st.markdown("<p style='text-align:center;color:var(--text-400);font-size:0.68rem;margin-top:1.5rem;'>Powered by Dentsu AI · Secure & Confidential</p>", unsafe_allow_html=True)
+                        else: st.error("Username already taken.")st.markdown("<p style='text-align:center;color:var(--text-400);font-size:0.68rem;margin-top:1.5rem;'>Powered by Dentsu AI · Secure & Confidential</p>", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════
@@ -1013,27 +1169,32 @@ def render_login():
 def render_sidebar():
     user = st.session_state["user"]
     with st.sidebar:
-        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Smart Buddy</div><div class="sub">AI Research Assistant</div></div>', unsafe_allow_html=True)
-        ini = user["display_name"][0].upper()
+        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Smart Buddy</div><div class="sub">AI Research Assistant</div></div>', unsafe_allow_html=True)ini = user["display_name"][0].upper()
         st.markdown(f'<div class="user-pill"><div class="av">{ini}</div><div><div class="nm">{user["display_name"]}</div><div class="rl">{user["role"].title()}</div></div></div>', unsafe_allow_html=True)
 
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
         with st.expander("🔑 API Configuration", expanded=not st.session_state.get("azure_endpoint")):
-            ep_val = st.text_input("Model Endpoint", value=st.session_state.get("azure_endpoint", ""),
-                                   placeholder="https://your-resource.openai.azure.com/", key="input_endpoint")
+            ep_val = st.text_input("Model Endpoint", value=st.session_state.get("azure_endpoint", ""),placeholder="https://your-resource.openai.azure.com/", key="input_endpoint")
             ak_val = st.text_input("Azure OpenAI API Key", value=st.session_state.get("azure_api_key", ""),
                                    placeholder="Enter your API key", key="input_api_key", type="password")
+            emb_val = st.text_input("Embedding Deployment Name",
+                                    value=st.session_state.get("azure_embed_deployment", "text-embedding-3-small"),
+                                    placeholder="text-embedding-3-small", key="input_embed_deployment")
             if st.button("Save Credentials", use_container_width=True, key="save_creds"):
                 if ep_val.strip() and ak_val.strip():
                     st.session_state["azure_endpoint"] = ep_val.strip()
                     st.session_state["azure_api_key"] = ak_val.strip()
+                    st.session_state["azure_embed_deployment"] = emb_val.strip() or "text-embedding-3-small"
                     st.session_state.pop("agent", None)
+                    st.session_state.pop("vectorstore", None)
+                    st.session_state.pop("bm25_retriever", None)
+                    st.session_state.pop("rag_graph", None)
                     st.success("Credentials saved!"); st.rerun()
                 else: st.warning("Both fields are required.")
 
         if st.button("＋  New conversation", use_container_width=True, key="new_chat"):
             st.session_state["current_conv"] = None; st.session_state["messages"] = []
-            st.session_state.pop("pending_web_search", None); st.rerun()
+            st.rerun()
 
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
         st.markdown("<p style='font-size:0.72rem;font-weight:700;color:var(--text-400);letter-spacing:0.1em;text-transform:uppercase;'>History</p>", unsafe_allow_html=True)
@@ -1060,10 +1221,10 @@ def render_sidebar():
         if "processed_files" not in st.session_state: st.session_state["processed_files"] = []
         if "doc_texts" not in st.session_state: st.session_state["doc_texts"] = {}
 
-        uploaded = st.file_uploader("Upload PDF, DOCX, TXT, CSV, Excel, Images",
-                                    type=["pdf","docx","txt","png","jpg","jpeg","gif","webp","csv","xlsx","xls"],
+        uploaded = st.file_uploader("Upload PDF, DOCX, TXT, CSV, Excel, Images",type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "gif", "webp", "csv", "xlsx", "xls"],
                                     accept_multiple_files=True, key="uploader")
         if uploaded:
+            new_files_added = False
             for uf in uploaded:
                 if uf.name not in st.session_state["processed_files"]:
                     with st.spinner(f"Reading {uf.name}..."):
@@ -1073,8 +1234,32 @@ def render_sidebar():
                             preview = txt[:500] if not (is_image_data(txt) or is_dataframe_data(txt)) else txt[:100]
                             save_doc_record(user["user_id"], uf.name, uf.name.split(".")[-1], preview)
                             st.session_state["processed_files"].append(uf.name)
-                            st.rerun()
-                        else: st.error(f"Failed: {uf.name}")
+                            new_files_added = True
+                else:
+                            st.error(f"Failed: {uf.name}")
+            if new_files_added:
+                st.session_state.pop("vectorstore", None)
+                st.session_state.pop("bm25_retriever", None)
+                st.session_state.pop("rag_graph", None)
+                st.rerun()
+
+        # Build (or rebuild) the vectorstore when text/URL docs are present
+        has_text_docs = any(
+            not (is_image_data(t) or is_dataframe_data(t))
+            for t in st.session_state.get("doc_texts", {}).values()
+        )
+        if (has_text_docsand "vectorstore" not in st.session_state
+            and st.session_state.get("azure_endpoint")
+            and st.session_state.get("azure_api_key")):
+            with st.spinner("Building knowledge base (chunking + embedding)..."):
+                try:
+                    vs, bm25 = build_vectorstore_from_docs()
+                    if vs:
+                        st.session_state["vectorstore"] = vs
+                        st.session_state["bm25_retriever"] = bm25
+                        st.session_state.pop("rag_graph", None)
+                except Exception as e:
+                    st.error(f"Index build error: {e}")
 
         # URL input
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
@@ -1085,23 +1270,31 @@ def render_sidebar():
                     content = load_url_content(url_input)
                     if not content.startswith("["):
                         doc_name = store_url_as_doc(url_input, content)
+                        st.session_state.pop("vectorstore", None)
+                        st.session_state.pop("bm25_retriever", None)
+                        st.session_state.pop("rag_graph", None)
                         st.success(f"Loaded: {doc_name}"); st.rerun()
-                    else: st.error(content)
+                    else:
+                        st.error(content)
 
-        # Show docs
         user_docs = get_user_docs(user["user_id"])
         if user_docs:
             for d in user_docs[:10]:
                 dc1, dc2 = st.columns([6, 1])
                 with dc1:
                     fn_l = d["filename"].lower()
-                    icon = "🖼️" if fn_l.endswith((".png",".jpg",".jpeg",".gif",".webp")) else "📊" if fn_l.endswith((".csv",".xlsx",".xls")) else "📄"
+                    icon = "🖼️" if fn_l.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")) else "📊" if fn_l.endswith((".csv", ".xlsx", ".xls")) else "📄"
                     st.markdown(f'<div class="doc-item"><span class="di">{icon}</span>{d["filename"]}</div>', unsafe_allow_html=True)
                 with dc2:
                     if st.button("×", key=f"deldoc_{d['id']}"):
                         fname = delete_document(d["id"], user["user_id"])
-                        if fname and fname in st.session_state.get("doc_texts", {}): del st.session_state["doc_texts"][fname]
-                        if fname and fname in st.session_state.get("processed_files", []): st.session_state["processed_files"].remove(fname)
+                        if fname and fname in st.session_state.get("doc_texts", {}):
+                            del st.session_state["doc_texts"][fname]
+                        if fname and fname in st.session_state.get("processed_files", []):
+                            st.session_state["processed_files"].remove(fname)
+                        st.session_state.pop("vectorstore", None)
+                        st.session_state.pop("bm25_retriever", None)
+                        st.session_state.pop("rag_graph", None)
                         st.rerun()
 
         for url, name in st.session_state.get("url_docs", {}).items():
@@ -1113,11 +1306,11 @@ def render_sidebar():
         if st.button("Sign out", use_container_width=True, key="logout"):
             for k in list(st.session_state.keys()): del st.session_state[k]
             st.rerun()
-        st.markdown("<p style='color:var(--text-400);font-size:0.62rem;text-align:center;padding-top:0.8rem;'>Dentsu Smart Buddy v5.1</p>", unsafe_allow_html=True)
+        st.markdown("<p style='color:var(--text-400);font-size:0.62rem;text-align:center;padding-top:0.8rem;'>Dentsu Smart Buddy v6.0</p>", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════
-# CHAT — Smart Routing
+# CHAT — Adaptive + Corrective RAG via LangGraph
 # ═══════════════════════════════════════════════
 
 def render_chat():
@@ -1126,7 +1319,7 @@ def render_chat():
         <div class="welcome-area">
             <div class="w-icon">🔑</div>
             <h2>Configure API Credentials</h2>
-            <p>Open <b>🔑 API Configuration</b> in the sidebar to get started.</p>
+            <p>Open<b>🔑 API Configuration</b> in the sidebar to get started.</p>
         </div>""", unsafe_allow_html=True)
         return
 
@@ -1137,8 +1330,8 @@ def render_chat():
         <div class="welcome-area">
             <div class="w-icon">🤖</div>
             <h2>Hi! I'm Dentsu Smart Buddy</h2>
-            <p>Upload documents, paste URLs, or just ask me anything.
-            I handle PDFs, images, CSVs, Excel files, and web research — all at once.</p>
+            <p>Upload documents, paste URLs, or justask me anything.
+            Powered by Adaptive + Corrective RAG with hybrid retrieval.</p>
         </div>""", unsafe_allow_html=True)
 
     for msg in messages:
@@ -1174,39 +1367,18 @@ def render_chat():
         with st.chat_message("user", avatar="🟢"):
             st.markdown(prompt)
 
-        # ── Handle pending web search confirmation ──
-        pending = st.session_state.pop("pending_web_search", None)
-        if pending:
-            yes_words = {"yes", "y", "yeah", "sure", "ok", "go ahead", "yep", "please", "do it"}
-            if prompt.strip().lower() in yes_words:
-                with st.chat_message("assistant", avatar="🤖"):
-                    with st.spinner("Searching the web..."):
-                        answer, sources, tool_info = run_web_agent(pending, user, cid)
-                    st.markdown(clean_answer_urls(answer, sources) if sources else answer)
-                    render_sources_and_tools(sources, tool_info)
-                save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
-                st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info})
-                return
-
-            no_words = {"no", "n", "nope", "nah", "cancel"}
-            if prompt.strip().lower() in no_words:
-                reply = "No problem! Ask me anything about your uploaded documents."
-                with st.chat_message("assistant", avatar="🤖"):
-                    st.markdown(reply)
-                save_message(cid, "assistant", reply)
-                st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None, "tool_calls": None})
-                return
-            # If neither yes nor no, treat as a new query — fall through
-
-        # ── Check for URL in chat ──
+        #── URL detection in chat ──
         detected_url = detect_url(prompt)
         if detected_url and detected_url not in st.session_state.get("url_docs", {}):
             with st.chat_message("assistant", avatar="🤖"):
-                with st.spinner(f"Loading content from URL..."):
+                with st.spinner("Loading content from URL..."):
                     content = load_url_content(detected_url)
                     if not content.startswith("["):
                         doc_name = store_url_as_doc(detected_url, content)
-                        answer = f"I've loaded **{doc_name}** into memory. You can now ask me questions about this article!"
+                        st.session_state.pop("vectorstore", None)
+                        st.session_state.pop("bm25_retriever", None)
+                        st.session_state.pop("rag_graph", None)
+                        answer = f"I've loaded **{doc_name}** into memory and indexed it. Ask me anything about this article!"
                     else:
                         answer = f"I couldn't load that URL: {content}"
                 st.markdown(answer)
@@ -1214,62 +1386,61 @@ def render_chat():
             st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": None, "tool_calls": "URL Content"})
             return
 
-        # ── MAIN ROUTING ──
-        has_docs = bool(st.session_state.get("doc_texts"))
+        # ── Specialized paths first: data analysis & vision ──
+        image_entries, text_entries, df_entries = classify_doc_types()
 
-        if has_docs:
-            # Keyword-based relevancy — fast, deterministic, no hallucination
-            query_about_docs = is_query_about_docs(prompt)
+        is_data_query = bool(df_entries) and any(kw in prompt.lower() for kw in [
+            "chart", "plot", "graph", "visuali", "bar", "pie", "line", "histogram", "scatter",
+            "trend", "distribution", "average", "mean", "sum", "count", "total", "max", "min",
+            "group", "compare", "top", "bottom", "sort", "filter", "percentage", "ratio"
+        ])
 
-            if query_about_docs:
-                # Route to combined document handler (supports all doc types at once)
-                image_entries, text_entries, df_entries = classify_doc_types()
-
-                with st.chat_message("assistant", avatar="🤖"):
-                    with st.spinner("Analyzing your documents..."):
-                        answer, sources, tool_info, chart_fig = run_combined_query(
-                            prompt, image_entries, text_entries, df_entries, user, cid
-                        )
-
-                    display_text = clean_answer_urls(answer, sources) if sources else answer
-                    st.markdown(display_text)
-
-                    chart_key = None
-                    if chart_fig is not None:
-                        chart_key = f"chart_{uuid.uuid4().hex[:8]}"
-                        st.session_state.setdefault("charts", {})[chart_key] = chart_fig
-                        st.pyplot(chart_fig)
-
-                    render_sources_and_tools(sources, tool_info)
-
-                save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
-                st.session_state["messages"].append(
-                    {"role": "assistant", "content": answer, "sources": sources,
-                     "tool_calls": tool_info, "chart_key": chart_key}
-                )
-
-            else:
-                # Not about docs — ask user if they want web search
-                routing_msg = ("This query doesn't appear to be related to your uploaded documents.\n\n"
-                              "Would you like me to **search the web** for an answer?\n\n"
-                              "Type **Yes** to search the web, or **No** to cancel.")
-                with st.chat_message("assistant", avatar="🤖"):
-                    st.markdown(routing_msg)
-                st.session_state["pending_web_search"] = prompt
-                save_message(cid, "assistant", routing_msg)
-                st.session_state["messages"].append(
-                    {"role": "assistant", "content": routing_msg, "sources": None, "tool_calls": "Smart Routing"}
-                )
-
-        else:
-            # No docs uploaded — straight to web agent
+        if is_data_query:
             with st.chat_message("assistant", avatar="🤖"):
-                with st.spinner("Researching your question..."):
-                    answer, sources, tool_info = run_web_agent(prompt, user, cid)
-                st.markdown(clean_answer_urls(answer, sources) if sources else answer)
+                with st.spinner("Analyzing data..."):
+                    answer, fig = run_dataframe_analysis(prompt, df_entries)
+                st.markdown(answer)chart_key = None
+                if fig is not None:
+                    chart_key = f"chart_{uuid.uuid4().hex[:8]}"
+                    st.session_state.setdefault("charts", {})[chart_key] = fig
+                    st.pyplot(fig)
+                render_sources_and_tools([], "Data Analysis")
+            save_message(cid, "assistant", answer, tool_calls="Data Analysis")
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": answer, "sources": None,
+                 "tool_calls": "Data Analysis", "chart_key": chart_key}
+            )
+            return
+
+        if image_entries:
+            with st.chat_message("assistant", avatar="🤖"):
+                with st.spinner("Analyzing image(s) + context..."):
+                    answer, sources, tool_info, _ = run_combined_query(
+                        prompt, image_entries, text_entries, df_entries, user, cid
+                    )
+                display_text = clean_answer_urls(answer, sources) if sources else answer
+                st.markdown(display_text)
                 render_sources_and_tools(sources, tool_info)
             save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
-            st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info})
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info}
+            )
+            return
+
+        # ── MAIN: Adaptive + Corrective RAG via LangGraph ──
+        with st.chat_message("assistant", avatar="🤖"):
+            with st.spinner("Thinking..."):
+                try:
+                    answer, sources, tool_info = run_rag(prompt)
+                except Exception as e:
+                    answer, sources, tool_info = run_web_agent(prompt, user, cid)tool_info = f"{tool_info or''} (RAG fallback: {e})".strip()display_text = clean_answer_urls(answer, sources) if sources else answer
+            st.markdown(display_text)
+            render_sources_and_tools(sources, tool_info)
+
+        save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info}
+        )
 
 
 # ═══════════════════════════════════════════════
