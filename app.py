@@ -1003,9 +1003,10 @@ def extract_sources(text):
 def clean_answer_urls(text, sources):
     if not sources: return text
     protected = text; phs = {}
-    for i, m in enumerate(re.finditer(r'\[([^\]]+)\]\(https?://[^\)]+\)', text)):ph = f"MDLNK{i}X"; phs[ph] = m.group(0); protected = protected.replace(m.group(0), ph, 1)
+    for i, m in enumerate(re.finditer(r'\[([^\]]+)\]\(https?://[^\)]+\)', text)):
+        ph = f"MDLNK{i}X"; phs[ph] = m.group(0); protected = protected.replace(m.group(0), ph, 1)
     cleaned = re.sub(r'https?://[^\s\)\]>"\'`,]+', '', protected)
-    forph, orig in phs.items(): cleaned = cleaned.replace(ph, orig)
+    for ph, orig in phs.items(): cleaned = cleaned.replace(ph, orig)
     cleaned = re.sub(r'Source:\s*$', '', cleaned, flags=re.M)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
