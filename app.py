@@ -1161,7 +1161,8 @@ def render_login():
                     else:
                         r = register_user(nc, p1)
                         if r: st.success(f"Account created! Sign in as **{nc}**.")
-                        else: st.error("Username already taken.")st.markdown("<p style='text-align:center;color:var(--text-400);font-size:0.68rem;margin-top:1.5rem;'>Powered by Dentsu AI · Secure & Confidential</p>", unsafe_allow_html=True)
+                        else: st.error("Username already taken.")
+        st.markdown("<p style='text-align:center;color:var(--text-400);font-size:0.68rem;margin-top:1.5rem;'>Powered by Dentsu AI · Secure & Confidential</p>", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════
@@ -1171,7 +1172,8 @@ def render_login():
 def render_sidebar():
     user = st.session_state["user"]
     with st.sidebar:
-        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Smart Buddy</div><div class="sub">AI Research Assistant</div></div>', unsafe_allow_html=True)ini = user["display_name"][0].upper()
+        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Smart Buddy</div><div class="sub">AI Research Assistant</div></div>', unsafe_allow_html=True)
+        ini = user["display_name"][0].upper()
         st.markdown(f'<div class="user-pill"><div class="av">{ini}</div><div><div class="nm">{user["display_name"]}</div><div class="rl">{user["role"].title()}</div></div></div>', unsafe_allow_html=True)
 
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
@@ -1250,8 +1252,8 @@ def render_sidebar():
             not (is_image_data(t) or is_dataframe_data(t))
             for t in st.session_state.get("doc_texts", {}).values()
         )
-        if (has_text_docsand "vectorstore" not in st.session_state
-            and st.session_state.get("azure_endpoint")
+        if (has_text_docs
+            and "vectorstore" not in st.session_stateand and st.session_state.get("azure_endpoint")
             and st.session_state.get("azure_api_key")):
             with st.spinner("Building knowledge base (chunking + embedding)..."):
                 try:
@@ -1401,7 +1403,8 @@ def render_chat():
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("Analyzing data..."):
                     answer, fig = run_dataframe_analysis(prompt, df_entries)
-                st.markdown(answer)chart_key = None
+                st.markdown(answer)
+                chart_key = None
                 if fig is not None:
                     chart_key = f"chart_{uuid.uuid4().hex[:8]}"
                     st.session_state.setdefault("charts", {})[chart_key] = fig
@@ -1435,7 +1438,9 @@ def render_chat():
                 try:
                     answer, sources, tool_info = run_rag(prompt)
                 except Exception as e:
-                    answer, sources, tool_info = run_web_agent(prompt, user, cid)tool_info = f"{tool_info or''} (RAG fallback: {e})".strip()display_text = clean_answer_urls(answer, sources) if sources else answer
+                    answer, sources, tool_info = run_web_agent(prompt, user, cid)
+                    tool_info = f"{tool_info or''} (RAG fallback: {e})".strip()
+            display_text = clean_answer_urls(answer, sources) if sources else answer
             st.markdown(display_text)
             render_sources_and_tools(sources, tool_info)
 
